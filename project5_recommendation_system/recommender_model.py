@@ -1,10 +1,30 @@
 """
 PROJECT 5: Movie Recommendation System
-Category: Recommendation System (Collaborative Filtering + Content-Based Hybrid)
-Algorithm: SVD (Matrix Factorization) + Cosine Similarity (Content-Based)
+Category  : Recommendation System — Hybrid (CF + Content-Based)
+Algorithm : SVD Matrix Factorization + Cosine Similarity
 
-Streaming platforms (Netflix, Prime Video, Spotify) live and die by recommendations.
-A 1% improvement in click-through rate on recommendations = millions in revenue.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHY SVD + COSINE SIMILARITY (HYBRID)?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Alternatives considered:
+  • Pure Collaborative Filtering (CF)     → fails for new users/movies (cold start)
+  • Pure Content-Based                    → misses 'wisdom of crowds' signal
+  • ALS (Alternating Least Squares)       → better for implicit feedback (clicks)
+  • Neural CF (NCF / Two-Tower)           → state-of-art but needs GPU + large data
+  • Association Rules (Apriori)           → finds co-occurrence but no personalization
+
+HYBRID wins because:
+  1. CF (SVD) captures "users like you also liked..." — social signal
+  2. Content-Based handles cold start — new movie can still get recommended
+  3. Weighted blend (α) is tunable per use case (streaming vs e-commerce)
+  4. SVD is fast and scalable — Netflix ran matrix factorization at scale
+
+HOW SVD WORKS:
+  User-Item matrix R (300×50) → decompose into U × Σ × V^T
+  U  = user latent factors  (what "type" of viewer each user is)
+  Σ  = importance of each latent dimension
+  V  = item latent factors  (what "genre DNA" each movie has)
+  Predicted rating = row of U · row of V = dot product of taste vectors
 """
 
 import numpy as np
@@ -19,10 +39,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 import joblib
 
-# ─────────────────────────────────────────────
-# C. DUMMY DATA GENERATION
-# ─────────────────────────────────────────────
-GENRES = ["Action", "Comedy", "Drama", "Sci-Fi", "Romance", "Thriller", "Horror", "Animation"]
+ARTIFACT_DIR = os.path.join(os.path.dirname(__file__), "artifacts")
+
+GENRES = ["Action", "Comedy", "Drama", "Sci-Fi", "Romance",
+          "Thriller", "Horror", "Animation"]
 
 MOVIE_NAMES = [
     "Galactic Storm", "The Laughing Owl", "Tears in August", "Neon Odyssey",
@@ -41,49 +61,39 @@ MOVIE_NAMES = [
 ]
 
 
+# ─────────────────────────────────────────────
+# C. DUMMY DATA GENERATION
+# ─────────────────────────────────────────────
 def generate_recommendation_data(n_users=300, n_movies=50, seed=42):
-    np.random.seed(seed)
     rng = np.random.default_rng(seed)
 
-    # ── Movies catalog ───────────────────────
     movies = []
     for i, name in enumerate(MOVIE_NAMES[:n_movies]):
         genre  = GENRES[i % len(GENRES)]
-        year   = rng.integers(2000, 2025)
+        year   = int(rng.integers(2000, 2025))
         rating = round(float(rng.uniform(5.5, 9.5)), 1)
         movies.append({
-            "movie_id":    i,
-            "title":       name,
-            "genre":       genre,
-            "year":        year,
-            "avg_rating":  rating,
-            "popularity":  rng.integers(1000, 500000),
+            "movie_id":   i, "title": name, "genre": genre,
+            "year": year, "avg_rating": rating,
+            "popularity": int(rng.integers(1000, 500000)),
         })
     df_movies = pd.DataFrame(movies)
 
-    # ── Genre preference per user (latent factor) ─────
-    user_genre_pref = rng.dirichlet(np.ones(len(GENRES)), size=n_users)  # (n_users, n_genres)
+    # User taste vectors (Dirichlet gives realistic genre preferences)
+    user_genre_pref = rng.dirichlet(np.ones(len(GENRES)), size=n_users)
 
-    # ── Ratings matrix (sparse) ──────────────
     ratings = []
-    for user_id in range(n_users):
-        # Each user rates 8-25 movies
-        n_rated  = rng.integers(8, 26)
+    for uid in range(n_users):
+        n_rated   = int(rng.integers(10, 30))
         movie_ids = rng.choice(n_movies, size=n_rated, replace=False)
         for mid in movie_ids:
-            genre_idx = GENRES.index(df_movies.loc[mid, "genre"])
-            pref      = user_genre_pref[user_id, genre_idx]
-            base_r    = df_movies.loc[mid, "avg_rating"]
-            # User rating influenced by genre preference + noise
-            rating    = np.clip(base_r * pref * 1.5 + rng.normal(0, 0.8), 1, 5)
-            ratings.append({
-                "user_id":  user_id,
-                "movie_id": int(mid),
-                "rating":   round(float(rating), 1),
-            })
+            g_idx  = GENRES.index(df_movies.loc[mid, "genre"])
+            pref   = user_genre_pref[uid, g_idx]
+            base_r = df_movies.loc[mid, "avg_rating"]
+            r      = float(np.clip(base_r * pref * 1.4 + rng.normal(0, 0.6), 1, 5))
+            ratings.append({"user_id": uid, "movie_id": int(mid), "rating": round(r, 1)})
 
-    df_ratings = pd.DataFrame(ratings)
-    return df_movies, df_ratings
+    return df_movies, pd.DataFrame(ratings)
 
 
 # ─────────────────────────────────────────────
@@ -97,136 +107,219 @@ def build_user_item_matrix(df_ratings, n_users, n_movies):
 
 
 def train_svd_model(matrix, n_components=20):
-    """
-    SVD = Singular Value Decomposition
-    Decomposes the user-item matrix into latent factors (taste dimensions).
-    Think of it as: each user and movie gets a vector of hidden preferences.
-    """
-    svd = TruncatedSVD(n_components=n_components, random_state=42)
-    user_factors  = svd.fit_transform(matrix)
-    item_factors  = svd.components_.T   # shape: (n_movies, n_components)
+    svd          = TruncatedSVD(n_components=n_components, random_state=42)
+    user_factors = svd.fit_transform(matrix)
     reconstructed = user_factors @ svd.components_
 
-    # Evaluate on known ratings (not a true train/test split — for illustration)
-    known_mask    = matrix > 0
-    actual        = matrix[known_mask]
-    predicted     = reconstructed[known_mask]
-    rmse          = np.sqrt(mean_squared_error(actual, predicted))
+    known_mask = matrix > 0
+    actual     = matrix[known_mask]
+    predicted  = reconstructed[known_mask]
+    rmse       = np.sqrt(mean_squared_error(actual, predicted))
 
-    print("=" * 55)
-    print("PROJECT 5 — Movie Recommendation System (SVD Hybrid)")
-    print("=" * 55)
-    print(f"SVD components    : {n_components}")
-    print(f"Explained variance: {svd.explained_variance_ratio_.sum():.2%}")
-    print(f"Reconstruction RMSE (known ratings): {rmse:.4f}")
+    print("=" * 60)
+    print("PROJECT 5 — Movie Recommender (SVD Hybrid)")
+    print("=" * 60)
+    print(f"SVD components      : {n_components}")
+    print(f"Explained variance  : {svd.explained_variance_ratio_.sum():.2%}")
+    print(f"Reconstruction RMSE : {rmse:.4f}  (on known ratings 1–5 scale)")
 
-    return svd, user_factors, item_factors, reconstructed
+    return svd, user_factors, svd.components_.T, reconstructed
 
 
 def build_content_matrix(df_movies):
-    """One-hot encode genre + normalize year and popularity."""
     genre_dummies = pd.get_dummies(df_movies["genre"])
     scaler = StandardScaler()
     extra  = scaler.fit_transform(df_movies[["year", "avg_rating", "popularity"]])
-    content_matrix = np.hstack([genre_dummies.values, extra])
-    return content_matrix
+    return np.hstack([genre_dummies.values.astype(float), extra])
 
 
 def get_svd_recommendations(user_id, reconstructed, df_movies, df_ratings, top_n=5):
-    """Pure collaborative filtering via SVD."""
-    rated_movies = set(df_ratings[df_ratings["user_id"] == user_id]["movie_id"])
-    scores       = reconstructed[user_id]
-    scored_movies = [
-        (i, scores[i]) for i in range(len(scores)) if i not in rated_movies
-    ]
-    scored_movies.sort(key=lambda x: x[1], reverse=True)
-    top_ids = [m[0] for m in scored_movies[:top_n]]
-    return df_movies[df_movies["movie_id"].isin(top_ids)][["title", "genre", "avg_rating"]]
+    rated = set(df_ratings[df_ratings["user_id"] == user_id]["movie_id"])
+    scores = [(i, reconstructed[user_id, i]) for i in range(len(df_movies)) if i not in rated]
+    scores.sort(key=lambda x: x[1], reverse=True)
+    ids = [m[0] for m in scores[:top_n]]
+    return df_movies[df_movies["movie_id"].isin(ids)][["title", "genre", "avg_rating"]]
 
 
 def get_content_recommendations(movie_title, df_movies, content_matrix, top_n=5):
-    """Content-based: find similar movies by genre/year/rating."""
     idx = df_movies[df_movies["title"] == movie_title].index
     if len(idx) == 0:
         return pd.DataFrame()
-    idx = idx[0]
-    sim   = cosine_similarity(content_matrix[idx].reshape(1, -1), content_matrix)[0]
-    order = np.argsort(sim)[::-1]
-    order = [i for i in order if i != idx][:top_n]
+    sim   = cosine_similarity(content_matrix[idx[0]].reshape(1, -1), content_matrix)[0]
+    order = [i for i in np.argsort(sim)[::-1] if i != idx[0]][:top_n]
     return df_movies.iloc[order][["title", "genre", "avg_rating"]]
 
 
 def get_hybrid_recommendations(user_id, movie_title, reconstructed, df_movies,
                                df_ratings, content_matrix, top_n=5, alpha=0.6):
-    """
-    Hybrid score = alpha × SVD_score + (1 - alpha) × content_similarity
-    alpha = weight given to collaborative filtering vs content-based
-    """
-    rated_movies = set(df_ratings[df_ratings["user_id"] == user_id]["movie_id"])
-    svd_scores   = reconstructed[user_id]
+    rated      = set(df_ratings[df_ratings["user_id"] == user_id]["movie_id"])
+    svd_scores = reconstructed[user_id]
+    seed_idx   = df_movies[df_movies["title"] == movie_title].index
+    sim = (cosine_similarity(content_matrix[seed_idx[0]].reshape(1, -1), content_matrix)[0]
+           if len(seed_idx) > 0 else np.ones(len(df_movies)) / len(df_movies))
 
-    # Content similarity from seed movie
-    seed_idx = df_movies[df_movies["title"] == movie_title].index
-    if len(seed_idx) > 0:
-        sim = cosine_similarity(
-            content_matrix[seed_idx[0]].reshape(1, -1), content_matrix
-        )[0]
-    else:
-        sim = np.ones(len(df_movies)) / len(df_movies)
-
-    hybrid = {}
-    for i in range(len(df_movies)):
-        if i in rated_movies:
-            continue
-        score = alpha * svd_scores[i] + (1 - alpha) * sim[i] * 5.0
-        hybrid[i] = score
-
+    hybrid = {i: alpha * svd_scores[i] + (1 - alpha) * sim[i] * 5.0
+              for i in range(len(df_movies)) if i not in rated}
     top_ids = sorted(hybrid, key=hybrid.get, reverse=True)[:top_n]
-    result  = df_movies[df_movies["movie_id"].isin(top_ids)][["movie_id", "title", "genre", "avg_rating"]].copy()
+    result  = df_movies[df_movies["movie_id"].isin(top_ids)][
+        ["movie_id", "title", "genre", "avg_rating"]].copy()
     result["hybrid_score"] = result["movie_id"].map(lambda x: round(hybrid.get(x, 0), 3))
     return result.sort_values("hybrid_score", ascending=False)
 
 
 # ─────────────────────────────────────────────
-# E. EXPLAINABILITY
+# E. VISUALIZATIONS
 # ─────────────────────────────────────────────
-def plot_latent_space(user_factors, n_show=50):
+
+def plot_matrix_sparsity(matrix):
+    """
+    Sparsity map: white = rated, black = unrated.
+    This is the core challenge — recommending from mostly empty data.
+    """
+    sample_m = matrix[:60, :]
+    fig, ax  = plt.subplots(figsize=(12, 5))
+    ax.imshow(sample_m == 0, cmap="gray_r", aspect="auto", interpolation="nearest")
+    ax.set_xlabel("Movie ID (0–49)", fontsize=11)
+    ax.set_ylabel("User ID (first 60 users)", fontsize=11)
+    ax.set_title(f"Rating Matrix Sparsity — Black = Rated, White = Unknown\n"
+                 f"Sparsity: {(matrix==0).mean():.1%}  "
+                 f"(this is what the model fills in!)", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(ARTIFACT_DIR, "rec_sparsity.png"), dpi=130)
+    plt.close()
+    print("Saved: rec_sparsity.png")
+
+
+def plot_svd_explained_variance(svd):
+    """
+    Each component captures a different 'taste dimension'.
+    Cumulative line shows how many components you need to capture 80% of variance.
+    """
+    ev  = svd.explained_variance_ratio_
+    cum = np.cumsum(ev)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    ax1.bar(range(1, len(ev)+1), ev * 100, color="steelblue")
+    ax1.set_xlabel("SVD Component (latent taste dimension)")
+    ax1.set_ylabel("Variance Explained (%)");
+    ax1.set_title("Per-Component Explained Variance\n"
+                  "Each component = one 'taste dimension' (e.g., 'loves Sci-Fi')")
+    ax1.grid(alpha=0.3)
+
+    ax2.plot(range(1, len(cum)+1), cum * 100, "o-", color="darkorange", lw=2)
+    ax2.axhline(80, color="red", lw=1.5, linestyle="--", label="80% threshold")
+    ax2.set_xlabel("Number of Components")
+    ax2.set_ylabel("Cumulative Variance Explained (%)")
+    ax2.set_title("Cumulative Variance — How many components do we need?")
+    ax2.legend(); ax2.grid(alpha=0.3)
+
+    plt.suptitle("SVD Decomposition — Discovering Hidden Taste Dimensions",
+                 fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(ARTIFACT_DIR, "rec_svd_variance.png"), dpi=130)
+    plt.close()
+    print("Saved: rec_svd_variance.png")
+
+
+def plot_user_latent_space(user_factors, n_show=100):
+    """
+    PCA on user latent factors → 2D map.
+    Users clustered together have similar tastes.
+    """
     from sklearn.decomposition import PCA
-    pca = PCA(n_components=2, random_state=42)
+    pca    = PCA(n_components=2, random_state=42)
     coords = pca.fit_transform(user_factors[:n_show])
-    plt.figure(figsize=(7, 5))
-    plt.scatter(coords[:, 0], coords[:, 1], alpha=0.6, c=range(n_show), cmap="tab20")
-    plt.xlabel("Latent Factor 1 (taste dimension)"); plt.ylabel("Latent Factor 2")
-    plt.title(f"User Taste Map — First {n_show} Users (SVD Latent Space)")
-    plt.colorbar(label="User ID")
+    ev     = pca.explained_variance_ratio_
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    sc = ax.scatter(coords[:, 0], coords[:, 1], c=range(n_show),
+                    cmap="tab20", alpha=0.75, s=55, edgecolors="white", lw=0.3)
+    plt.colorbar(sc, ax=ax, label="User ID")
+    ax.set_xlabel(f"Taste Dimension 1  ({ev[0]*100:.1f}% var)")
+    ax.set_ylabel(f"Taste Dimension 2  ({ev[1]*100:.1f}% var)")
+    ax.set_title(f"User Taste Map — SVD Latent Space\n"
+                 f"Nearby users = similar movie preferences\n"
+                 f"(First {n_show} users shown)", fontsize=11)
+    ax.grid(alpha=0.2)
     plt.tight_layout()
-    os.makedirs("artifacts", exist_ok=True)
-    plt.savefig("artifacts/rec_user_latent.png", dpi=120)
+    plt.savefig(os.path.join(ARTIFACT_DIR, "rec_user_latent.png"), dpi=130)
     plt.close()
-    print("Saved: artifacts/rec_user_latent.png")
+    print("Saved: rec_user_latent.png")
 
 
-def plot_rating_distribution(df_ratings):
-    plt.figure(figsize=(6, 4))
-    plt.hist(df_ratings["rating"], bins=20, color="steelblue", edgecolor="white")
-    plt.xlabel("Rating (1-5)"); plt.ylabel("Count")
-    plt.title("Rating Distribution")
+def plot_rating_distribution(df_ratings, df_movies):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # 1. Rating histogram
+    axes[0].hist(df_ratings["rating"], bins=20, color="steelblue", edgecolor="white")
+    axes[0].set_xlabel("Rating (1–5)"); axes[0].set_ylabel("Count")
+    axes[0].set_title("Overall Rating Distribution")
+
+    # 2. Ratings per user
+    rpu = df_ratings.groupby("user_id").size()
+    axes[1].hist(rpu, bins=25, color="darkorchid", edgecolor="white")
+    axes[1].set_xlabel("# Movies Rated per User"); axes[1].set_ylabel("# Users")
+    axes[1].set_title(f"Ratings per User\nAvg = {rpu.mean():.1f}")
+
+    # 3. Avg rating per genre
+    merged = df_ratings.merge(df_movies[["movie_id", "genre"]], on="movie_id")
+    genre_avg = merged.groupby("genre")["rating"].mean().sort_values(ascending=False)
+    axes[2].barh(genre_avg.index, genre_avg.values, color="#f39c12")
+    axes[2].set_xlabel("Average Rating"); axes[2].set_title("Average Rating by Genre")
+    for i, v in enumerate(genre_avg.values):
+        axes[2].text(v + 0.02, i, f"{v:.2f}", va="center", fontsize=9)
+
+    plt.suptitle("Rating Data Analysis", fontsize=13, fontweight="bold")
     plt.tight_layout()
-    plt.savefig("artifacts/rec_rating_dist.png", dpi=120)
+    plt.savefig(os.path.join(ARTIFACT_DIR, "rec_rating_dist.png"), dpi=130)
     plt.close()
-    print("Saved: artifacts/rec_rating_dist.png")
+    print("Saved: rec_rating_dist.png")
 
 
-def plot_genre_popularity(df_movies):
+def plot_genre_dist(df_movies):
     genre_counts = df_movies["genre"].value_counts()
-    plt.figure(figsize=(7, 4))
-    plt.bar(genre_counts.index, genre_counts.values, color="darkorchid")
-    plt.xlabel("Genre"); plt.ylabel("Number of Movies"); plt.title("Genre Distribution")
-    plt.xticks(rotation=30)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(genre_counts.index, genre_counts.values, color=plt.cm.Set2(np.linspace(0, 1, len(genre_counts))))
+    ax.set_xlabel("Genre"); ax.set_ylabel("# Movies"); ax.set_title("Movie Genre Distribution")
+    ax.tick_params(axis="x", rotation=30)
     plt.tight_layout()
-    plt.savefig("artifacts/rec_genre_dist.png", dpi=120)
+    plt.savefig(os.path.join(ARTIFACT_DIR, "rec_genre_dist.png"), dpi=130)
     plt.close()
-    print("Saved: artifacts/rec_genre_dist.png")
+    print("Saved: rec_genre_dist.png")
+
+
+def plot_hybrid_score_breakdown(user_id, movie_title, reconstructed, df_movies,
+                                df_ratings, content_matrix):
+    """
+    Visual breakdown: how CF score and Content score contribute to final hybrid score.
+    """
+    rated      = set(df_ratings[df_ratings["user_id"] == user_id]["movie_id"])
+    svd_scores = reconstructed[user_id]
+    seed_idx   = df_movies[df_movies["title"] == movie_title].index
+    sim = (cosine_similarity(content_matrix[seed_idx[0]].reshape(1, -1), content_matrix)[0]
+           if len(seed_idx) > 0 else np.ones(len(df_movies)) / len(df_movies))
+
+    candidate_ids = [i for i in range(len(df_movies)) if i not in rated][:15]
+    titles   = [df_movies.loc[df_movies["movie_id"] == i, "title"].values[0] for i in candidate_ids]
+    cf_sc    = [svd_scores[i] for i in candidate_ids]
+    cont_sc  = [sim[i] * 5.0 for i in candidate_ids]
+    hybrid   = [0.6 * c + 0.4 * s for c, s in zip(cf_sc, cont_sc)]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x       = np.arange(len(titles))
+    w       = 0.28
+    ax.bar(x - w, cf_sc,   w, label="CF Score (SVD)",     color="steelblue", alpha=0.85)
+    ax.bar(x,     cont_sc, w, label="Content Score",       color="darkorchid", alpha=0.85)
+    ax.bar(x + w, hybrid,  w, label="Hybrid (α=0.6 CF)",  color="#2ecc71", alpha=0.9)
+    ax.set_xticks(x); ax.set_xticklabels(titles, rotation=40, ha="right", fontsize=8)
+    ax.set_ylabel("Score"); ax.set_title(
+        f"Hybrid Score Breakdown — User {user_id} | Seed: {movie_title}\n"
+        "Green bar = final recommendation score (higher = better)", fontsize=11)
+    ax.legend(); ax.grid(alpha=0.2, axis="y")
+    plt.tight_layout()
+    plt.savefig(os.path.join(ARTIFACT_DIR, "rec_hybrid_breakdown.png"), dpi=130)
+    plt.close()
+    print("Saved: rec_hybrid_breakdown.png")
 
 
 # ─────────────────────────────────────────────
@@ -235,30 +328,29 @@ def plot_genre_popularity(df_movies):
 if __name__ == "__main__":
     df_movies, df_ratings = generate_recommendation_data(300, 50)
     print(f"Movies: {len(df_movies)}  |  Ratings: {len(df_ratings)}")
-    print(df_ratings.head(5))
 
-    matrix = build_user_item_matrix(df_ratings, 300, 50)
+    matrix  = build_user_item_matrix(df_ratings, 300, 50)
     svd, user_factors, item_factors, reconstructed = train_svd_model(matrix)
     content_matrix = build_content_matrix(df_movies)
 
-    os.makedirs("artifacts", exist_ok=True)
-    joblib.dump({"svd": svd, "reconstructed": reconstructed,
-                 "content_matrix": content_matrix,
-                 "df_movies": df_movies, "df_ratings": df_ratings},
-                "artifacts/rec_model.pkl")
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+    joblib.dump({
+        "svd": svd, "reconstructed": reconstructed,
+        "user_factors": user_factors,
+        "content_matrix": content_matrix,
+        "df_movies": df_movies, "df_ratings": df_ratings,
+    }, os.path.join(ARTIFACT_DIR, "rec_model.pkl"))
 
-    print("\n=== SVD Recommendations for User 0 ===")
-    print(get_svd_recommendations(0, reconstructed, df_movies, df_ratings))
-
-    print("\n=== Content Recommendations for 'Galactic Storm' ===")
-    print(get_content_recommendations("Galactic Storm", df_movies, content_matrix))
-
-    print("\n=== Hybrid Recommendations for User 0 (seed: Galactic Storm) ===")
-    print(get_hybrid_recommendations(0, "Galactic Storm", reconstructed,
+    print("\n=== Recommendations for User 42 ===")
+    print(get_hybrid_recommendations(42, "Galactic Storm", reconstructed,
                                      df_movies, df_ratings, content_matrix))
 
-    plot_latent_space(user_factors)
-    plot_rating_distribution(df_ratings)
-    plot_genre_popularity(df_movies)
+    plot_matrix_sparsity(matrix)
+    plot_svd_explained_variance(svd)
+    plot_user_latent_space(user_factors)
+    plot_rating_distribution(df_ratings, df_movies)
+    plot_genre_dist(df_movies)
+    plot_hybrid_score_breakdown(42, "Galactic Storm", reconstructed,
+                                 df_movies, df_ratings, content_matrix)
 
-    print("\nAll artifacts saved in artifacts/ folder.")
+    print("\n✅ All Project 5 artifacts saved.")
